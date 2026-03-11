@@ -213,7 +213,6 @@ This repository currently centers around one executable script:
 
 Supporting project files:
 
-- `CLAUDE.md`: contributor and agent guidance
 - `.gitignore`: ignored local cache artifacts
 
 ## License
