@@ -35,7 +35,7 @@ TOOLS = [
                     "risk_level": {
                         "type": "string",
                         "enum": ["low", "high"],
-                        "description": "Risk level, set to high for dangerous ops (rm/reboot/service stop, etc.)",
+                        "description": "Set to 'high' for commands that modify system state (write, delete, install, restart, config change). 'low' for read-only commands.",
                     },
                 },
                 "required": ["command", "risk_level"],
@@ -69,7 +69,7 @@ TOOLS = [
                     "risk_level": {
                         "type": "string",
                         "enum": ["low", "high"],
-                        "description": "Risk level, set to high when overwriting important files",
+                        "description": "Set to 'high' for system/config files (/etc, /boot, dotfiles, service configs). 'low' for temporary or application-level files.",
                     },
                 },
                 "required": ["path", "content", "risk_level"],
@@ -96,25 +96,28 @@ def _build_system_prompt(language=None):
     except Exception:
         pass
 
-    prompt = f"""You are an ATOOL system assistant that completes user tasks step by step using tools.
+    prompt = f"""You are ATOOL, an ops assistant. You complete system administration tasks step by step using tools.
 
-Current environment: {sysinfo}
+Environment: {sysinfo}
 
-Rules:
-1. Check before acting: verify current state with read-only commands before making changes
-2. Set risk_level="high" for dangerous operations (rm -rf, reboot, systemctl stop, kill, fdisk, mkfs, modifying /etc configs, etc.)
-3. Set risk_level="low" for read-only operations (ls, cat, ps, df, top, etc.)
-4. Command output can be long — prefer head/tail/grep to limit output and avoid returning too much at once
-5. If a task cannot be done with a single command, generate a script
-6. When a command fails, analyze the cause and try to fix it
-7. Forbidden: never execute rm -rf /, format root partition, or other destructive irreversible operations
-8. Provide a brief summary when the task is done, do not ask the user what to do next"""
+## Safety
+- risk_level="high" for any operation that modifies system state: writing/deleting files, changing configs, restarting services, modifying permissions, altering network/firewall, package install/remove. All read-only operations are "low"
+- For important changes (config files, services, network, firewall): briefly note the rollback method
+
+## Workflow
+- Check before acting: verify current state with read-only commands before making changes
+- When a command fails, analyze the cause and try to fix it
+
+## Output
+- Prefer head/tail/grep to limit long output; never redirect stderr to /dev/null
+- Use multi-line shell scripts when a task needs multiple commands
+- End with a brief summary of what was done and the result; do not ask what to do next"""
 
     # Language instruction
     if language and language in LANGUAGE_MAP:
-        prompt += f"\n9. {LANGUAGE_MAP[language][1]}"
+        prompt += f"\n- {LANGUAGE_MAP[language][1]}"
     else:
-        prompt += "\n9. You must respond in the same language as the user's task description"
+        prompt += "\n- You must respond in the same language as the user's task description"
 
     # Merge user custom prompt
     custom_prompt_path = os.path.join(ATOOL_DIR, "ATOOL.md")
