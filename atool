@@ -2,6 +2,7 @@
 """ATOOL - AI-driven ops CLI tool"""
 
 import argparse
+import base64
 import configparser
 import json
 import os
@@ -15,6 +16,16 @@ import urllib.request
 import urllib.error
 
 IS_WINDOWS = platform.system() == "Windows"
+
+def _is_owner(path):
+    """Check if the current user owns the file (always True on Windows)"""
+    return IS_WINDOWS or os.stat(path).st_uid == os.getuid()
+
+def _secure_chmod(path, mode):
+    """Set file permissions (no-op on Windows)"""
+    if not IS_WINDOWS:
+        os.chmod(path, mode)
+
 ATOOL_DIR = os.path.expanduser("~/.atool")
 CONF_PATH = os.path.join(ATOOL_DIR, "config.ini")
 CONTEXT_PATH = os.path.join(ATOOL_DIR, "context.json")
@@ -77,6 +88,20 @@ TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_image",
+            "description": "Read an image file and return its contents for visual analysis",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Image file path"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
 ]
 
 LANGUAGE_MAP = {
@@ -97,6 +122,13 @@ def _build_system_prompt(language=None):
     except Exception:
         pass
 
+    if IS_WINDOWS:
+        output_filter = "Prefer Select-String/findstr to filter long output; never use 2>$null or 2>nul to discard stderr"
+        output_script = "Use multi-line PowerShell scripts when a task needs multiple commands"
+    else:
+        output_filter = "Prefer head/tail/grep to limit long output; never redirect stderr to /dev/null"
+        output_script = "Use multi-line shell scripts when a task needs multiple commands"
+
     prompt = f"""You are ATOOL, an ops assistant. You complete system administration tasks step by step using tools.
 
 Environment: {sysinfo}
@@ -110,8 +142,8 @@ Environment: {sysinfo}
 - When a command fails, analyze the cause and try to fix it
 
 ## Output
-- {"Prefer Select-String/findstr to filter long output; never use 2>$null or 2>nul to discard stderr" if IS_WINDOWS else "Prefer head/tail/grep to limit long output; never redirect stderr to /dev/null"}
-- {"Use multi-line PowerShell scripts when a task needs multiple commands" if IS_WINDOWS else "Use multi-line shell scripts when a task needs multiple commands"}
+- {output_filter}
+- {output_script}
 - End with a brief summary of what was done and the result; do not ask what to do next"""
 
     # Language instruction
@@ -155,7 +187,7 @@ def _load_oauth_token(provider):
             return None
         if not os.path.exists(path):
             return None
-        if not IS_WINDOWS and os.stat(path).st_uid != os.getuid():
+        if not _is_owner(path):
             print(f"\033[31mWarning: {path} has unexpected owner, ignored\033[0m")
             return None
         with open(path) as f:
@@ -171,6 +203,8 @@ def _load_oauth_token(provider):
 # Configuration loading
 # ============================================================
 
+_CONFIG_KEYS = ("api_url", "api_key", "model", "proxy", "auth_type", "confirm_default", "max_tokens", "language", "interactive")
+
 def load_config(args):
     """Merge config file, env vars, CLI args. Priority: CLI > env > config file > defaults"""
     # Determine provider first
@@ -180,13 +214,13 @@ def load_config(args):
     conf_path = CONF_PATH
     if os.path.exists(conf_path):
         # Check config file ownership to prevent tampering
-        if not IS_WINDOWS and os.stat(conf_path).st_uid != os.getuid():
+        if not _is_owner(conf_path):
             print("\033[31mWarning: config file has unexpected owner, ignored\033[0m")
         else:
             cp = configparser.ConfigParser()
             cp.read(conf_path)
             if cp.has_section("default"):
-                for key in ("provider", "api_url", "api_key", "model", "proxy", "auth_type", "confirm_default", "max_tokens", "language"):
+                for key in ("provider",) + _CONFIG_KEYS:
                     if cp.has_option("default", key):
                         file_config[key] = cp.get("default", key)
 
@@ -207,7 +241,7 @@ def load_config(args):
               "proxy": "", "auth_type": "key", "confirm_default": "y"}
 
     # Config file
-    for key in ("api_url", "api_key", "model", "proxy", "auth_type", "confirm_default", "max_tokens"):
+    for key in _CONFIG_KEYS:
         if key in file_config:
             config[key] = file_config[key]
     # Compat: old config auth_type=api_key
@@ -353,8 +387,12 @@ def _openai_request(state, config):
     return {"content": msg.get("content"), "tool_calls": tool_calls}
 
 
-def _openai_add_tool_result(state, call_id, result_str):
-    state.append({"role": "tool", "tool_call_id": call_id, "content": result_str})
+def _openai_add_tool_result(state, call_id, result):
+    if isinstance(result, dict) and result.get("_image"):
+        content = f"[Image: data:{result['media_type']};base64,{result['data']}]"
+    else:
+        content = result
+    state.append({"role": "tool", "tool_call_id": call_id, "content": content})
 
 
 # ============================================================
@@ -406,8 +444,13 @@ def _claude_request(state, config):
     return {"content": content, "tool_calls": tool_calls}
 
 
-def _claude_add_tool_result(state, call_id, result_str):
-    result_block = {"type": "tool_result", "tool_use_id": call_id, "content": result_str}
+def _claude_add_tool_result(state, call_id, result):
+    if isinstance(result, dict) and result.get("_image"):
+        content = [{"type": "image", "source": {"type": "base64",
+                    "media_type": result["media_type"], "data": result["data"]}}]
+    else:
+        content = result
+    result_block = {"type": "tool_result", "tool_use_id": call_id, "content": content}
     msgs = state["messages"]
     # Merge multiple tool_results into the same user message
     if msgs and msgs[-1]["role"] == "user" and isinstance(msgs[-1]["content"], list):
@@ -536,6 +579,27 @@ def read_file(path):
         return {"error": str(e)}
 
 
+_IMAGE_EXTENSIONS = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                     ".gif": "image/gif", ".webp": "image/webp", ".bmp": "image/bmp"}
+MAX_IMAGE_SIZE = 20 * 1024 * 1024  # 20MB
+
+
+def read_image(path):
+    try:
+        path = os.path.realpath(os.path.expanduser(path))
+        ext = os.path.splitext(path)[1].lower()
+        media_type = _IMAGE_EXTENSIONS.get(ext)
+        if not media_type:
+            return {"error": f"Unsupported image format: {ext}"}
+        if os.path.getsize(path) > MAX_IMAGE_SIZE:
+            return {"error": "Image too large (>20MB)"}
+        with open(path, "rb") as f:
+            data = base64.b64encode(f.read()).decode("ascii")
+        return {"_image": True, "media_type": media_type, "data": data}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def write_file(path, content):
     try:
         path = os.path.realpath(os.path.expanduser(path))
@@ -551,6 +615,7 @@ TOOL_HANDLERS = {
     "execute_command": lambda a: execute_command(a["command"]),
     "read_file": lambda a: read_file(a["path"]),
     "write_file": lambda a: write_file(a["path"], a["content"]),
+    "read_image": lambda a: read_image(a["path"]),
 }
 
 
@@ -672,8 +737,7 @@ def _save_context(state, provider):
         os.makedirs(ATOOL_DIR, exist_ok=True, mode=0o700)
         with open(CONTEXT_PATH, "w") as f:
             json.dump({"provider": provider, "state": state}, f, ensure_ascii=False)
-        if not IS_WINDOWS:
-            os.chmod(CONTEXT_PATH, 0o600)
+        _secure_chmod(CONTEXT_PATH, 0o600)
     except Exception:
         pass
 
@@ -713,7 +777,7 @@ def _load_context(provider):
 def _format_tool_args(name, args):
     if name == "execute_command":
         return args["command"]
-    if name in ("read_file", "write_file"):
+    if name in ("read_file", "write_file", "read_image"):
         return args["path"]
     return json.dumps(args, ensure_ascii=False)
 
@@ -740,6 +804,9 @@ def _print_result(name, result):
             print(f"\033[31m  Error: {result['error']}\033[0m")
         else:
             print("  Write successful")
+    elif name == "read_image":
+        if "error" in result:
+            print(f"\033[31m  Error: {result['error']}\033[0m")
 
 
 def main_loop(task, config, auto_yes, continue_ctx=False):
@@ -811,6 +878,10 @@ def main_loop(task, config, auto_yes, continue_ctx=False):
                     print(f"\033[31m  Unknown tool: {name}\033[0m")
                 elif confirm_action(name, args, auto_yes, config.get("confirm_default", "y")):
                     result = TOOL_HANDLERS[name](args)
+                    if isinstance(result, dict) and result.get("_image") and "error" not in result:
+                        print(f"  \033[32mImage loaded ({len(result['data']) * 3 // 4 // 1024}KB)\033[0m")
+                        p["add_tool_result"](state, tc["id"], result)
+                        continue
                     _print_result(name, result)
                     result_str = json.dumps(_truncate_result(result), ensure_ascii=False)
                 else:
@@ -920,8 +991,7 @@ def setup_wizard(config):
 
     with open(conf_path, "w") as f:
         cp.write(f)
-    if not IS_WINDOWS:
-        os.chmod(conf_path, 0o600)
+    _secure_chmod(conf_path, 0o600)
 
     print(f"\n\033[32mConfig saved to {conf_path}\033[0m\n")
 
@@ -940,6 +1010,7 @@ def main():
     parser.add_argument("--api-key", help="API Key (prefer env var or config file, CLI args are visible in process list)")
     parser.add_argument("--model", help="Model name")
     parser.add_argument("--proxy", help="Proxy address (http/https/socks5)")
+    parser.add_argument("-i", "--interactive", action="store_true", help="Interactive continuous mode")
     args = parser.parse_args()
 
     config = load_config(args)
@@ -948,26 +1019,49 @@ def main():
         setup_wizard(config)
         config = load_config(args)
 
-    if args.task:
-        task = " ".join(args.task)
-    elif sys.stdin.isatty():
-        task = input("Enter task: ").strip()
-    else:
-        print("\033[31mError: please specify task via arguments in non-interactive mode\033[0m")
-        sys.exit(1)
-    if not task:
-        print("\033[31mError: task cannot be empty\033[0m")
-        sys.exit(1)
-
+    interactive = args.interactive or config.get("interactive") in ("true", "1", "yes")
     _init_proxy(config.get("proxy"))
-    main_loop(task, config, args.yes, args.continue_ctx)
+    task = " ".join(args.task) if args.task else ""
+
+    if interactive:
+        continue_ctx = args.continue_ctx
+        # Run initial task from CLI args if provided
+        if task:
+            main_loop(task, config, args.yes, continue_ctx)
+            continue_ctx = True
+        # Interactive input loop
+        print("\033[36mInteractive mode (type 'quit' to exit)\033[0m")
+        while True:
+            try:
+                task = input("\033[36m> \033[0m").strip()
+            except (KeyboardInterrupt, EOFError):
+                print()
+                break
+            if not task:
+                continue
+            if task.lower() in ("quit", "exit", "q"):
+                break
+            main_loop(task, config, args.yes, continue_ctx)
+            continue_ctx = True
+    else:
+        if not task:
+            if sys.stdin.isatty():
+                task = input("Enter task: ").strip()
+            else:
+                print("\033[31mError: please specify task via arguments in non-interactive mode\033[0m")
+                sys.exit(1)
+        if not task:
+            print("\033[31mError: task cannot be empty\033[0m")
+            sys.exit(1)
+        main_loop(task, config, args.yes, args.continue_ctx)
 
 
 if __name__ == "__main__":
     if IS_WINDOWS:
-        os.system("")  # 启用 Windows 10+ ANSI 支持
+        os.system("")  # Enable Windows 10+ ANSI support
     try:
         main()
     except (KeyboardInterrupt, EOFError):
         print()
+        sys.exit(130)
         sys.exit(130)
