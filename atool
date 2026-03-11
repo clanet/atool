@@ -14,6 +14,7 @@ import time
 import urllib.request
 import urllib.error
 
+IS_WINDOWS = platform.system() == "Windows"
 ATOOL_DIR = os.path.expanduser("~/.atool")
 CONF_PATH = os.path.join(ATOOL_DIR, "config.ini")
 CONTEXT_PATH = os.path.join(ATOOL_DIR, "context.json")
@@ -109,8 +110,8 @@ Environment: {sysinfo}
 - When a command fails, analyze the cause and try to fix it
 
 ## Output
-- Prefer head/tail/grep to limit long output; never redirect stderr to /dev/null
-- Use multi-line shell scripts when a task needs multiple commands
+- {"Prefer Select-String/findstr to filter long output; never use 2>$null or 2>nul to discard stderr" if IS_WINDOWS else "Prefer head/tail/grep to limit long output; never redirect stderr to /dev/null"}
+- {"Use multi-line PowerShell scripts when a task needs multiple commands" if IS_WINDOWS else "Use multi-line shell scripts when a task needs multiple commands"}
 - End with a brief summary of what was done and the result; do not ask what to do next"""
 
     # Language instruction
@@ -154,7 +155,7 @@ def _load_oauth_token(provider):
             return None
         if not os.path.exists(path):
             return None
-        if os.stat(path).st_uid != os.getuid():
+        if not IS_WINDOWS and os.stat(path).st_uid != os.getuid():
             print(f"\033[31mWarning: {path} has unexpected owner, ignored\033[0m")
             return None
         with open(path) as f:
@@ -179,7 +180,7 @@ def load_config(args):
     conf_path = CONF_PATH
     if os.path.exists(conf_path):
         # Check config file ownership to prevent tampering
-        if os.stat(conf_path).st_uid != os.getuid():
+        if not IS_WINDOWS and os.stat(conf_path).st_uid != os.getuid():
             print("\033[31mWarning: config file has unexpected owner, ignored\033[0m")
         else:
             cp = configparser.ConfigParser()
@@ -671,7 +672,8 @@ def _save_context(state, provider):
         os.makedirs(ATOOL_DIR, exist_ok=True, mode=0o700)
         with open(CONTEXT_PATH, "w") as f:
             json.dump({"provider": provider, "state": state}, f, ensure_ascii=False)
-        os.chmod(CONTEXT_PATH, 0o600)
+        if not IS_WINDOWS:
+            os.chmod(CONTEXT_PATH, 0o600)
     except Exception:
         pass
 
@@ -918,7 +920,8 @@ def setup_wizard(config):
 
     with open(conf_path, "w") as f:
         cp.write(f)
-    os.chmod(conf_path, 0o600)
+    if not IS_WINDOWS:
+        os.chmod(conf_path, 0o600)
 
     print(f"\n\033[32mConfig saved to {conf_path}\033[0m\n")
 
@@ -961,6 +964,8 @@ def main():
 
 
 if __name__ == "__main__":
+    if IS_WINDOWS:
+        os.system("")  # 启用 Windows 10+ ANSI 支持
     try:
         main()
     except (KeyboardInterrupt, EOFError):
