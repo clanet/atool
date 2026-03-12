@@ -525,9 +525,28 @@ def _read_stream(stream, parts, max_chars):
     return False
 
 
+def _kill_proc(proc):
+    """Kill process and its children"""
+    try:
+        if IS_WINDOWS:
+            subprocess.call(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            proc.kill()
+    except OSError:
+        pass
+
+
 def execute_command(command):
     try:
-        proc = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if IS_WINDOWS:
+            # Run via PowerShell directly to avoid cmd.exe mangling pipes and quotes
+            proc = subprocess.Popen(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        else:
+            proc = subprocess.Popen(command, shell=True,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         stdout_parts, stderr_parts = [], []
         truncated = [False, False]  # [stdout, stderr]
 
@@ -537,21 +556,25 @@ def execute_command(command):
         def read_err():
             truncated[1] = _read_stream(proc.stderr, stderr_parts, MAX_CHARS)
 
-        t1 = threading.Thread(target=read_out)
-        t2 = threading.Thread(target=read_err)
+        t1 = threading.Thread(target=read_out, daemon=True)
+        t2 = threading.Thread(target=read_err, daemon=True)
         t1.start()
         t2.start()
+        # Use short join intervals so KeyboardInterrupt can be caught promptly
         deadline = time.monotonic() + 300
-        t1.join(timeout=300)
-        t2.join(timeout=max(0, deadline - time.monotonic()))
+        while t1.is_alive() and time.monotonic() < deadline:
+            t1.join(timeout=0.5)
+        remaining = max(0, deadline - time.monotonic())
+        while t2.is_alive() and time.monotonic() < deadline:
+            t2.join(timeout=0.5)
 
         # Force kill if still writing after truncation
         if truncated[0] or truncated[1] or t1.is_alive() or t2.is_alive():
-            proc.kill()
+            _kill_proc(proc)
         try:
             proc.wait(timeout=10)
         except subprocess.TimeoutExpired:
-            proc.kill()
+            _kill_proc(proc)
             proc.wait()
             return {"stdout": "".join(stdout_parts), "stderr": "Command timed out (300s)", "returncode": -1}
 
@@ -562,6 +585,10 @@ def execute_command(command):
         if truncated[1]:
             stderr += f"\n... (output exceeded {MAX_CHARS} chars, truncated)"
         return {"stdout": stdout, "stderr": stderr, "returncode": proc.returncode}
+    except KeyboardInterrupt:
+        _kill_proc(proc)
+        proc.wait()
+        return {"stdout": "".join(stdout_parts), "stderr": "Interrupted by user (Ctrl+C)", "returncode": -1}
     except Exception as e:
         return {"stdout": "", "stderr": str(e), "returncode": -1}
 
@@ -710,6 +737,9 @@ def _compact_context(state, provider):
         if msg["role"] == "user" and isinstance(msg.get("content"), str):
             break
         cut += 1
+    else:
+        # No valid cut point found, skip compaction
+        return
 
     if cut <= 1:
         return
