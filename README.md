@@ -10,6 +10,9 @@ It is a single-file Python tool designed for day-to-day terminal work such as in
 - Supports `openai`, `claude`, and `codex` providers
 - Single-file Python script with no external dependencies
 - Built-in confirmation flow for risky actions
+- Model-supplied sensitivity, reason, verification, and rollback metadata for state-changing actions
+- Patch-first file editing with exact replacements and anchored inserts for safer updates to existing text files
+- Atomic file updates with automatic backups before existing files are replaced
 - Conversation context persistence for multi-step tasks
 - Optional custom system prompt via `~/.atool/ATOOL.md`
 - Proxy support for HTTP/HTTPS and SOCKS5
@@ -20,14 +23,19 @@ It is a single-file Python tool designed for day-to-day terminal work such as in
 ATOOL sends your task description to a model and lets the model use a small set of local tools:
 
 - `execute_command`: run shell commands
-- `read_file`: read local files
+- `stat_path`: inspect lightweight path metadata without shelling out
+- `list_dir`: inspect directory contents without shelling out
+- `read_file`: read local files, including focused line ranges
+- `search_text`: search for text in a file or directory tree
+- `patch_file`: apply exact text replacements or anchored inserts to existing files
 - `write_file`: write local files
+- `read_image`: read local images for visual analysis
 
 The tool runs in a loop:
 
 1. Send your task to the selected model
 2. Receive tool calls from the model
-3. Ask for confirmation before executing actions
+3. Use model-supplied sensitivity metadata to decide whether confirmation is needed
 4. Feed the execution result back to the model
 5. Continue until the task is complete or the iteration limit is reached
 
@@ -69,7 +77,7 @@ Continue the previous conversation context:
 ./atool -c "continue troubleshooting the service"
 ```
 
-Skip confirmation prompts:
+Skip low/medium confirmation prompts:
 
 ```bash
 ./atool -y "clean temporary files older than 7 days"
@@ -92,7 +100,7 @@ usage: atool [-h] [-y] [-c] [-p {openai,claude,codex}] [--api-url API_URL]
 
 Options:
 
-- `-y`, `--yes`: skip all confirmations
+- `-y`, `--yes`: skip low/medium confirmations; high-sensitivity actions still ask
 - `-c`, `--continue`: continue previous conversation
 - `-p`, `--provider`: choose `openai`, `claude`, or `codex`
 - `--api-url`: override API base URL
@@ -183,12 +191,21 @@ ATOOL is designed to be useful without being fully hands-off.
 Key behaviors:
 
 - Commands are executed through explicit tool calls
-- Risky actions can be reviewed before execution
+- `execute_command` supports explicit `cwd`, `timeout_sec`, and `shell` settings so the model can avoid shell syntax unless it is needed; `shell=true` is reserved for shell syntax or builtins such as pipes, redirects, env assignments, `cd`, `export`, or `source`
+- `stat_path`, `list_dir`, `search_text`, and `read_file` cover common inspection flows without falling back to shell commands
+- `execute_command`, `patch_file`, and `write_file` tool calls must include sensitivity, state-change, reason, verify, and rollback fields
+- High-sensitivity actions can be reviewed before execution
+- Existing text files can be updated through exact-match patches and anchor-based inserts instead of full-file rewrites
+- Full-file replacement of an existing file is automatically treated as high sensitivity
+- High-sensitivity patch confirmations include a short diff preview before execution
+- Existing files are backed up automatically before `patch_file` or `write_file` replaces them
+- `-y` skips low/medium confirmations but still stops for high-sensitivity actions
 - Config ownership is checked before loading secrets
 - Reading the config file through the model tool is blocked to avoid leaking API keys
+- A thin local safeguard still forces confirmation for a few obviously dangerous command and path patterns
 - The main loop has an iteration cap to prevent runaway sessions
 
-That said, ATOOL can still execute real system commands. Review actions carefully, especially when using `-y`.
+That said, ATOOL can still execute real system commands. Review actions carefully, especially when approving high-sensitivity operations.
 
 ## Typical Use Cases
 
@@ -200,10 +217,9 @@ That said, ATOOL can still execute real system commands. Review actions carefull
 
 ## Limitations
 
-- No test suite is included right now
 - Primarily built for terminal-based Unix-like environments
 - Network/API behavior depends on the selected provider
-- Tool access is intentionally limited to command execution and file read/write
+- Tool access is intentionally limited to command execution and a small set of file/search helpers
 
 ## Development
 
@@ -214,6 +230,13 @@ This repository currently centers around one executable script:
 Supporting project files:
 
 - `.gitignore`: ignored local cache artifacts
+- `tests/test_atool.py`: focused unit tests for editing, search, and confirmation helpers
+
+Run the current test suite with:
+
+```bash
+python3 -m unittest discover -s tests -p 'test_*.py'
+```
 
 ## License
 
