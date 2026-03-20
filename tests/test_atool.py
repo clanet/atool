@@ -172,10 +172,6 @@ class AtoolTests(unittest.TestCase):
                 "path": str(new_path),
                 "content": "new\n",
                 "sensitivity": "medium",
-                "changes_state": True,
-                "reason": "update file",
-                "verify": "read file",
-                "rollback": "",
             }
             high_args = dict(medium_args, path=str(existing_path), sensitivity="high")
 
